@@ -74,6 +74,8 @@ using namespace pcl;
 
 ros::NodeHandlePtr nh_ptr;
 
+std::vector<myTf<double>> tf_Bprev_Bcurr_all;
+
 // Visualizing the current pose
 void publishPose(PointPose &currPose)
 {
@@ -210,7 +212,47 @@ void OptimizePoseGraph(CloudPosePtr &kfPose, int prevId, int currId, myTf<double
 
         // Create prior relative pose factors and the residual block to ceres. Use the RelOdomFactor() class
         // ...
+        // Loop through all keyframes, except the last one, to create relative pose constraints between consecutive keyframes
+        for (int i = 0; i < KF_NUM - 1; i++)
+        {
+            // Compute the relative transformation (T_meas) between keyframe i and keyframe i+1
+            // T_meas = T_i.inverse() * T_(i+1)
+            myTf tf_meas = myTf(kfPose->points[i]).inverse() 
+                        * myTf(kfPose->points[i + 1]);
 
+            // Define the odometry frame of reference:
+            // "odom_i" is the origin (position = [0, 0, 0], orientation = identity quaternion)
+            Eigen::Vector3d p_odom_i = Eigen::Vector3d::Zero();
+            Eigen::Quaterniond q_odom_i = Eigen::Quaterniond::Identity();
+
+            // Extract the position and orientation of the relative transformation (tf_meas)
+            // "odom_j" is the position and orientation from tf_meas
+            Eigen::Vector3d p_odom_j = tf_meas.pos.cast<double>();
+            Eigen::Quaterniond q_odom_j = tf_meas.rot.cast<double>();
+
+            // Set the noise levels for position and orientation (measurement uncertainty)
+            double p_odom_n = 0.01; // Standard deviation of position measurement
+            double q_odom_n = 0.01; // Standard deviation of orientation measurement
+
+            // Create a cost function for the relative pose constraint using RelOdomFactor
+            ceres::CostFunction* cost_function = new RelOdomFactor(
+                p_odom_i, p_odom_j, // Position of odom_i and odom_j
+                q_odom_i, q_odom_j, // Orientation of odom_i and odom_j
+                p_odom_n, q_odom_n  // Noise levels for position and orientation
+            );
+
+            // Add the cost function as a residual block to the Ceres problem
+            // It links the poses of keyframe i and keyframe i+1 in the optimization problem
+            auto block_id = problem.AddResidualBlock(
+                cost_function,  // The cost function
+                nullptr,        // No loss function (could use HuberLoss for robustness)
+                PARAM_POSE[i],  // Parameter block for keyframe i's pose
+                PARAM_POSE[i+1] // Parameter block for keyframe i+1's pose
+            );
+
+            // Store the residual block ID for further analysis (e.g., computing the cost)
+            res_ids_relpose.push_back(block_id);
+        }
     /* ASSIGNMENT BLOCK END -----------------------------------------------------------------------------------------*/
 
     /* #endregion Add the {}^k_{k+1}\bar{T} factors -----------------------------------------------------------------*/
@@ -224,6 +266,42 @@ void OptimizePoseGraph(CloudPosePtr &kfPose, int prevId, int currId, myTf<double
         // Create loop relative pose factors and the residual block to ceres. Use the RelOdomFactor() class
         // ..
 
+        // Define the reference frame for the loop closure factor
+        // "odom_i" is set as the origin (position = [0, 0, 0] and orientation = identity quaternion)
+        Eigen::Vector3d p_odom_i = Eigen::Vector3d::Zero();
+        Eigen::Quaterniond q_odom_i = Eigen::Quaterniond::Identity();
+
+        // Extract the relative transformation (position and orientation) from the loop closure
+        // "odom_j" is derived from the transformation tf_Bprev_Bcurr (loop closure between prevId and currId)
+        tf_Bprev_Bcurr_all.push_back(tf_Bprev_Bcurr);
+        Eigen::Vector3d p_odom_j = tf_Bprev_Bcurr.pos.cast<double>();
+        Eigen::Quaterniond q_odom_j = tf_Bprev_Bcurr.rot.cast<double>();
+
+        // Set the noise levels for the loop closure factor
+        // These values represent the uncertainty in the position and orientation measurements
+        double p_odom_n = 0.01; // Standard deviation for position
+        double q_odom_n = 0.01; // Standard deviation for orientation
+
+        // Create the cost function for the loop closure factor
+        // RelOdomFactor is used to enforce the relative pose constraint between prevId and currId
+        ceres::CostFunction* cost_function = new RelOdomFactor(
+            p_odom_i, p_odom_j, // Position of odom_i and odom_j
+            q_odom_i, q_odom_j, // Orientation of odom_i and odom_j
+            p_odom_n, q_odom_n  // Noise levels for position and orientation
+        );
+
+        // Add the loop closure constraint as a residual block in the Ceres optimization problem
+        // This connects the poses of keyframe prevId and currId
+        auto loop_block_id = problem.AddResidualBlock(
+            cost_function,      // The cost function enforcing the relative pose constraint
+            nullptr,            // No robust loss function (can use HuberLoss for robustness)
+            PARAM_POSE[prevId], // Parameter block for the previous keyframe's pose
+            PARAM_POSE[currId]  // Parameter block for the current keyframe's pose
+        );
+
+        // Store the residual block ID for tracking and further analysis (e.g., cost computation)
+        res_ids_loop.push_back(loop_block_id);
+   
     /* ASSIGNMENT BLOCK END -----------------------------------------------------------------------------------------*/
 
     /* #endregion Add the loop prior factors ------------------------------------------------------------------------*/
@@ -316,6 +394,11 @@ int main(int argc, char **argv)
 
     /* #endregion Create some common objects ------------------------------------------------------------------------*/
 
+    //
+    // Variables to control ICP timing
+    static int loop_detected_at_frame = -1;
+    static ros::Time last_loop_time = ros::Time(0);
+    
     while (ros::ok())
     {
         // Increment the keyframe index
@@ -353,11 +436,50 @@ int main(int argc, char **argv)
         int prevId = -1;
         bool prevKfCandidateFound = false;
 
+        ///
+        // Logic to delay ICP after a loop closure
+        if (loop_detected_at_frame != -1 &&
+            ((currId - loop_detected_at_frame < 10) || (ros::Time::now() - last_loop_time < ros::Duration(3.0))))
+        {
+            this_thread::sleep_for(chrono::milliseconds(25));
+            continue;
+        }
+        ///
+
         /* ASSIGNMENT BLOCK START -----------------------------------------------------------------------------------*/
 
-            // Step 1. Use the kdtreekf.nearestksearch() function to search for N neighbours of currpose (you decide N).
-            // Step 2: Come up with some logics to determine a loop closure keyframe candidate in this neigbourhood.
-            // Step 3: Pass the ID of the keyframe candidate to "previd" and set prevkfcandidatefound to "true" to proceed.
+           // Step 1: Use kdTreeKF.nearestKSearch() to find K nearest neighbors of the current keyframe
+            int K = 20;               // Number of neighbors to search for
+            int minDeltaIdx = 30;     // Minimum index difference (to avoid selecting nearby keyframes)
+            std::vector<int>   searchIndices(K);   // Vector to store indices of the neighbors
+            std::vector<float> searchDists(K);     // Vector to store distances of the neighbors
+
+            int foundNum = kdTreeKF.nearestKSearch(
+                kfPose->points[currId], // Current keyframe as the query point
+                K,                      // Number of neighbors to search for
+                searchIndices,          // Output vector for neighbor indices
+                searchDists             // Output vector for distances
+            );
+
+            // Step 2: Identify a "loop candidate" from the search results
+            if (foundNum > 0) // If any neighbors were found
+            {
+                for (int i = 0; i < foundNum; i++)
+                {
+                    int candidateId = searchIndices[i]; // Get the candidate keyframe ID
+
+                    // Skip the candidate if it is too close (e.g., within 30 frames of the current keyframe)
+                    if (std::abs(candidateId - currId) < minDeltaIdx)
+                        continue;
+
+                    // Select the first candidate that satisfies the criteria
+                    prevId = candidateId;             // Set the candidate keyframe as the previous ID
+                    prevKfCandidateFound = true;      // Mark that a loop candidate was found
+                    break;                            // Stop searching after finding a valid candidate
+                }
+            }
+
+            // Step 3: Pass the ID of the keyframe candidate to "prevId" and set prevKfCandidateFound to "true" to proceed
 
         /* ASSIGNMENT BLOCK END -------------------------------------------------------------------------------------*/
 
@@ -452,6 +574,8 @@ int main(int argc, char **argv)
 
             // Optimize the pose graph
             OptimizePoseGraph(kfPose, prevId, currId, tf_Bprev_Bcurr);
+            loop_detected_at_frame = currId;
+            last_loop_time = ros::Time::now();
         }
 
         // Publish all of the keyframe pose

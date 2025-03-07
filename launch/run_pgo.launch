@@ -1,10 +1,14 @@
 <launch>
 
     <!-- Launch the pgo node -->
-    <param name="/data_path" type="string" value="/media/tmn/KTHSSD/GoogleDrive/BritskNguyen/KTH/OBLAM Course/OBLAM_PGO_DATA/mcd_ntu_daytime_04/" />
+    <param name="/data_path" type="string" value="/home/dat/catkin_ws/mcd_ntu_day_04/" />
     <node pkg="oblam_pgo" type="oblam_pgo_node" name="oblam_pgo" required="false" output="screen"/>
 
     <!-- Launch rviz -->
-    <node pkg="rviz" type="rviz" name="rviz" required="true" output="screen" args="-d $(find oblam_pgo)/launch/pgo.rviz"/>    
+    <node pkg="rviz" type="rviz" name="rviz" required="true" args="-d $(find oblam_pgo)/launch/pgo.rviz"/>    
+
+    <!-- Launch odom_record node -->
+    <node pkg="oblam_pgo" type="odom_record.py" name="odom_record" required="false"/>
+
 
 </launch>
